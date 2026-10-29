@@ -1,3 +1,4 @@
+
 name: Merge BOTW Base + Update
 
 on:
@@ -5,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
   merge:
@@ -14,8 +16,16 @@ jobs:
     steps:
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
-          df -h /
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          df -h
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip zip
+          python -m pip install --upgrade gdown
 
       - name: Download Base and Update
         env:
@@ -23,62 +33,99 @@ jobs:
           UPDATE_URL: ${{ secrets.BOTW_UPDATE_URL }}
         run: |
           set -euo pipefail
-          if [[ -z "$BASE_URL" || -z "$UPDATE_URL" ]]; then
-            echo "Missing Google Drive URL secrets"
+
+          if [ -z "$BASE_URL" ] || [ -z "$UPDATE_URL" ]; then
+            echo "ERROR: BOTW_BASE_URL or BOTW_UPDATE_URL secret is missing"
             exit 1
           fi
-          python3 -m venv "$RUNNER_TEMP/venv"
-          "$RUNNER_TEMP/venv/bin/pip" install gdown
-          "$RUNNER_TEMP/venv/bin/gdown" --fuzzy "$BASE_URL" -O "$RUNNER_TEMP/base.zip"
-          "$RUNNER_TEMP/venv/bin/gdown" --fuzzy "$UPDATE_URL" -O "$RUNNER_TEMP/update.zip"
+
+          mkdir -p /tmp/base /tmp/update
+
+          gdown "$BASE_URL" -O /tmp/base.zip
+          gdown "$UPDATE_URL" -O /tmp/update.zip
+
+          ls -lh /tmp/base.zip /tmp/update.zip
 
       - name: Extract and merge
-        shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/base" "$RUNNER_TEMP/update"
-          unzip -q "$RUNNER_TEMP/base.zip" -d "$RUNNER_TEMP/base"
-          rm "$RUNNER_TEMP/base.zip"
-          unzip -q "$RUNNER_TEMP/update.zip" -d "$RUNNER_TEMP/update"
-          rm "$RUNNER_TEMP/update.zip"
 
-          find_root() {
-            local f
-            f=$(find "$1" -type f -path '*/code/U-King.rpx' -print -quit)
-            test -n "$f" || return 1
-            dirname "$(dirname "$f")"
-          }
+          mkdir -p /tmp/base_extract /tmp/update_extract
 
-          BASE=$(find_root "$RUNNER_TEMP/base")
-          UPDATE=$(find_root "$RUNNER_TEMP/update")
+          unzip -q /tmp/base.zip -d /tmp/base_extract
+          unzip -q /tmp/update.zip -d /tmp/update_extract
+
+          BASE_RPX=$(find /tmp/base_extract -type f -path '*/code/U-King.rpx' -print -quit)
+          UPDATE_RPX=$(find /tmp/update_extract -type f -path '*/code/U-King.rpx' -print -quit)
+
+          if [ -z "$BASE_RPX" ]; then
+            echo "ERROR: Base U-King.rpx not found"
+            exit 1
+          fi
+
+          if [ -z "$UPDATE_RPX" ]; then
+            echo "ERROR: Update U-King.rpx not found"
+            exit 1
+          fi
+
+          BASE_GAME=$(dirname "$(dirname "$BASE_RPX")")
+          UPDATE_GAME=$(dirname "$(dirname "$UPDATE_RPX")")
+
+          echo "Base folder: $BASE_GAME"
+          echo "Update folder: $UPDATE_GAME"
 
           for d in code content meta; do
-            test -d "$BASE/$d"
-            test -d "$UPDATE/$d"
-            cp -a "$UPDATE/$d/." "$BASE/$d/"
+            if [ ! -d "$BASE_GAME/$d" ] || [ ! -d "$UPDATE_GAME/$d" ]; then
+              echo "ERROR: Missing $d folder"
+              exit 1
+            fi
           done
 
-          echo "BASE=$BASE" >> "$GITHUB_ENV"
+          for d in code content meta; do
+            cp -a "$UPDATE_GAME/$d/." "$BASE_GAME/$d/"
+          done
 
-      - name: Verify U-King.rpx
+          mkdir -p output
+          cp -a "$BASE_GAME" output/game
+
+      - name: Verify merged game
         run: |
+          set -euo pipefail
+
+          RPX="output/game/code/U-King.rpx"
+
+          if [ ! -f "$RPX" ]; then
+            echo "ERROR: Merged U-King.rpx missing"
+            exit 1
+          fi
+
+          sha256sum "$RPX"
+
           EXPECTED="ba58da5b95ce929e005d058ceb08b9b2788d1ab2bbc8a6c189bbadca0bb34d30"
-          ACTUAL=$(sha256sum "$BASE/code/U-King.rpx" | awk '{print $1}')
-          echo "Expected: $EXPECTED"
-          echo "Actual: $ACTUAL"
-          test "$ACTUAL" = "$EXPECTED"
+          ACTUAL=$(sha256sum "$RPX" | awk '{print $1}')
+
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "ERROR: U-King.rpx SHA256 does not match expected value"
+            echo "Expected: $EXPECTED"
+            echo "Actual:   $ACTUAL"
+            exit 1
+          fi
+
+          echo "BOTW merged game verification passed."
 
       - name: Create merged ZIP
         run: |
-          mkdir -p "$RUNNER_TEMP/output"
-          mv "$BASE" "$RUNNER_TEMP/output/game"
-          cd "$RUNNER_TEMP/output"
-          zip -qry -0 "$GITHUB_WORKSPACE/BOTW-WiiU-USA-v208-merged.zip" game
+          set -euo pipefail
+
+          cd output
+          zip -qry -0 BOTW-WiiU-USA-v208-merged.zip game
+
+          ls -lh BOTW-WiiU-USA-v208-merged.zip
 
       - name: Upload merged game
         uses: actions/upload-artifact@v4
         with:
           name: BOTW-WiiU-USA-v208-merged
-          path: BOTW-WiiU-USA-v208-merged.zip
-          compression-level: 0
+          path: output/BOTW-WiiU-USA-v208-merged.zip
+          if-no-files-found: error
           retention-days: 1
