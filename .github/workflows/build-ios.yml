@@ -1,0 +1,128 @@
+name: Build BotWRecomp iOS (unsigned IPA)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 360
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Checkout BotWRecomp source
+        uses: actions/checkout@v4
+        with:
+          repository: IshaanKalra2103/BotWRecomp
+          ref: main
+          path: BotWRecomp
+          persist-credentials: false
+
+      - name: Install build tools
+        run: |
+          brew install cmake ninja uv boost glm
+
+      - name: Cache generated C++ and iOS dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            BotWRecomp/generated
+            BotWRecomp/ios-deps
+          key: botw-v208-ios-${{ hashFiles('BotWRecomp/tools/**', 'BotWRecomp/cafe/**', 'BotWRecomp/runtime/src/game/**', 'BotWRecomp/ios/scripts/build_deps.sh') }}
+          restore-keys: |
+            botw-v208-ios-
+
+      - name: Download, merge, and validate my own Wii U game dump
+        env:
+          BOTW_BASE_URL: ${{ secrets.BOTW_BASE_URL }}
+          BOTW_UPDATE_URL: ${{ secrets.BOTW_UPDATE_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BOTW_BASE_URL:-}" ] || [ -z "${BOTW_UPDATE_URL:-}" ]; then
+            echo "::error::Add BOTW_BASE_URL and BOTW_UPDATE_URL under Settings > Secrets and variables > Actions. Each must point to your own Wii U base-game ZIP and v208 update ZIP."
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/botw-base" "$RUNNER_TEMP/botw-update"
+          uvx --from gdown gdown "$BOTW_BASE_URL" -O "$RUNNER_TEMP/botw-base.zip"
+          uvx --from gdown gdown "$BOTW_UPDATE_URL" -O "$RUNNER_TEMP/botw-update.zip"
+          unzip -q "$RUNNER_TEMP/botw-base.zip" -d "$RUNNER_TEMP/botw-base"
+          unzip -q "$RUNNER_TEMP/botw-update.zip" -d "$RUNNER_TEMP/botw-update"
+          BASE_RPX="$(find "$RUNNER_TEMP/botw-base" -type f -path '*/code/U-King.rpx' -print -quit)"
+          UPDATE_RPX="$(find "$RUNNER_TEMP/botw-update" -type f -path '*/code/U-King.rpx' -print -quit)"
+          if [ -z "$BASE_RPX" ] || [ -z "$UPDATE_RPX" ]; then
+            echo "::error::Could not find code/U-King.rpx in both ZIPs. Check that the base and update ZIPs contain the Wii U game folders."
+            exit 1
+          fi
+          GAME_ROOT="${BASE_RPX%/code/U-King.rpx}"
+          UPDATE_ROOT="${UPDATE_RPX%/code/U-King.rpx}"
+          cp -a "$UPDATE_ROOT/." "$GAME_ROOT/"
+          RPX="$GAME_ROOT/code/U-King.rpx"
+          test -d "$GAME_ROOT/content"
+          test -d "$GAME_ROOT/meta"
+          ACTUAL="$(shasum -a 256 "$RPX" | awk '{print $1}')"
+          EXPECTED="ba58da5b95ce929e005d058ceb08b9b2788d1ab2bbc8a6c189bbadca0bb34d30"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::U-King.rpx SHA-256 mismatch after merging. Confirm these are matching USA base and v208 / 1.6.0 update dumps."
+            exit 1
+          fi
+          echo "Merged game folder validated; game files will not be included in the IPA artifact."
+          echo "BOTW_RPX=$RPX" >> "$GITHUB_ENV"
+
+      - name: Recompile Wii U code to C++
+        working-directory: BotWRecomp
+        run: |
+          set -euo pipefail
+          if [ ! -f generated/table.cpp ] || ! compgen -G 'generated/fn_*.cpp' >/dev/null; then
+            uv run python -I tools/recompile.py "$BOTW_RPX" generated
+          else
+            echo "Using cached generated C++."
+          fi
+          test -f generated/table.cpp
+          compgen -G 'generated/fn_*.cpp' >/dev/null
+
+      - name: Build iOS dependencies
+        working-directory: BotWRecomp
+        env:
+          BOTW_IOS_JOBS: "4"
+        run: ios/scripts/build_deps.sh iphoneos
+
+      - name: Compile unsigned iPhone app
+        working-directory: BotWRecomp
+        env:
+          BOTW_BUNDLE_ID: com.pyaesonephyogameacc2003.BotWRecomp
+          BOTW_IOS_JOBS: "4"
+        run: |
+          set -euo pipefail
+          cmake -S ios -B build-ios/iphoneos -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=18.0 \
+            -DBOTW_BUNDLE_ID="$BOTW_BUNDLE_ID" \
+            -DBOTW_IOS_DEPS="$PWD/ios-deps"
+          cmake --build build-ios/iphoneos -j "$BOTW_IOS_JOBS"
+          test -d build-ios/iphoneos/BotWRecomp.app
+          test -f build-ios/iphoneos/BotWRecomp.app/Info.plist
+
+      - name: Package unsigned IPA (game files excluded)
+        working-directory: BotWRecomp
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/ipa-package"
+          mkdir -p "$RUNNER_TEMP/ipa-package/Payload"
+          ditto build-ios/iphoneos/BotWRecomp.app "$RUNNER_TEMP/ipa-package/Payload/BotWRecomp.app"
+          cd "$RUNNER_TEMP/ipa-package"
+          /usr/bin/zip -qry "$GITHUB_WORKSPACE/BotWRecomp-unsigned.ipa" Payload
+          test -s "$GITHUB_WORKSPACE/BotWRecomp-unsigned.ipa"
+
+      - name: Upload unsigned IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BotWRecomp-unsigned-IPA
+          path: BotWRecomp-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 3
