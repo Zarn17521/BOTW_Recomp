@@ -1,0 +1,48 @@
+name: no-bc shader diagnostics
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-shader-support:
+    runs-on: macos-15
+    steps:
+      - name: Checkout BotWRecomp source
+        uses: actions/checkout@v4
+        with:
+          repository: pyaesonephyogameacc2003-arch/BotWRecomp
+          ref: main
+          path: BotWRecomp
+
+      - name: Inspect iOS shader and BC-related code
+        shell: bash
+        run: |
+          set -uo pipefail
+          LOG="$GITHUB_WORKSPACE/no-bc-diagnostics.log"
+          {
+            cd "$GITHUB_WORKSPACE/BotWRecomp"
+            echo "=== Runner / SDK ==="
+            sw_vers
+            xcodebuild -version
+            echo "=== BC / shader references ==="
+            grep -RniE --exclude-dir=.git --exclude='*.lock' \
+              'BC[0-9]?|BC[1-7]|block compression|compressed texture|shader.*(bytecode|compile)|bytecode.*shader|MTLPixelFormatBC' \
+              runtime ios tools docs 2>/dev/null | head -n 500 || true
+            echo "=== iOS build scripts ==="
+            find ios -maxdepth 3 -type f \( -name '*.sh' -o -name 'CMakeLists.txt' -o -name '*.mm' -o -name '*.h' -o -name '*.cpp' \) | sort
+            echo "=== Notes ==="
+            echo "This workflow diagnoses BC/shader references only; it does not patch runtime code or build an IPA."
+            echo "Use the findings and exact runtime error to implement a targeted no-BC fix."
+          } 2>&1 | tee "$LOG"
+
+      - name: Upload diagnostic log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: no-bc-shader-diagnostics
+          path: no-bc-diagnostics.log
+          if-no-files-found: warn
+          retention-days: 7
